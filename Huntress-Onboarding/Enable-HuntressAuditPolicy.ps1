@@ -1,6 +1,7 @@
 # Enable-HuntressAuditPolicy.ps1
 # Configures Windows Advanced Audit Policy per Huntress recommendations
 # https://support.huntress.io/hc/en-us/articles/49363914702867
+# Updated 2026-04-10: Added Audit Security Group Management Failure, Detailed File Share Success, Other Policy Change Events Success, Sensitive Privilege Use Failure
 
 #Requires -RunAsAdministrator
 
