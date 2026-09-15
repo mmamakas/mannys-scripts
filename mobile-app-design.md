@@ -170,8 +170,121 @@ Entities the mobile app reads or writes. Schema details deferred until I can see
 9. Tag format choice — opaque ID vs URL — affects fallback behavior when scanned by a non-app camera.
 10. Voice note storage — duration cap, transcription (yes/no), retention.
 
+## Offline equipment cache — concrete shape
+
+The super's primary loop (scan → photo → annotate → sync) has to work with zero signal. This is the IndexedDB layout and sync protocol that makes that true. Store names are suggestions; adapt to whatever propglue's equipment schema actually calls things.
+
+### IndexedDB stores
+
+One database, `propglue-mobile`, versioned. Six object stores.
+
+| Store | Key | Indexes | Purpose |
+|---|---|---|---|
+| `buildings` | `id` | `updatedAt` | Buildings the user is assigned to. Includes lat/lng and geofence radius once the main app has them. |
+| `equipment` | `id` | `buildingId`, `assetTagId`, `updatedAt` | Full equipment records for assigned buildings. This is what a tag scan resolves against offline. |
+| `contacts` | `id` | `buildingId`, `role`, `trade` | Directory. `trade` index powers one-tap on-call contractor. |
+| `maintenanceOrders` | `id` | `buildingId`, `assigneeId`, `status`, `updatedAt` | MOs assigned to this user, plus open MOs for assigned buildings. |
+| `mutations` | `id` (UUID) | `createdAt`, `status`, `entityType` | The write queue. Every offline write lands here first. |
+| `blobs` | `id` (UUID) | `mutationId` | Photo and voice-note binaries, referenced by mutations. Kept separate so the `mutations` store stays small and fast to scan. |
+
+`meta` is a seventh single-row store holding `lastSyncAt`, `schemaVersion`, and `userId`. If `userId` changes at login, wipe everything.
+
+### Mutation record
+
+```json
+{
+  "id": "uuid",
+  "createdAt": 1758000000000,
+  "status": "pending | inflight | failed | done",
+  "attempts": 0,
+  "lastError": null,
+  "entityType": "equipmentPhoto | equipmentAnnotation | voiceNote | moStatus | inspectionItem",
+  "entityId": "server id, or a client-generated temp id for creates",
+  "payload": { },
+  "blobIds": ["uuid"]
+}
+```
+
+`status` moves pending → inflight → done, or → failed after a bounded number of attempts. Failed mutations are never silently dropped. They show in the pending-sync list with the error and a retry button.
+
+### Sync protocol
+
+**Pull** (on app open, on reconnect, on pull-to-refresh, and on a timer while foregrounded):
+
+1. `GET /api/mobile/sync?since=<lastSyncAt>` returns changed rows across all cached entity types for the user's assigned buildings, plus a list of deleted ids.
+2. Upsert into the matching stores. Apply deletes.
+3. Write the new `lastSyncAt` only after every upsert commits. A crash mid-pull replays from the old cursor, which is safe because upserts are idempotent.
+
+**Push** (whenever `navigator.onLine` flips true, and after every pull):
+
+1. Read `mutations` where `status = pending`, ordered by `createdAt`.
+2. For each, mark `inflight`, send it, and on success mark `done` and delete its blobs. On failure increment `attempts`, store the error, and mark `pending` again or `failed` once the cap is hit.
+3. Process strictly in order. A photo upload must land before the annotation that references it.
+4. Server responses that include a canonical id for a client-created entity rewrite the temp id in every later pending mutation before those are sent.
+
+Photos upload as multipart to the existing Cameras upload endpoint, since that path already works without QR. Voice notes go the same way with a different content type.
+
+**Background Sync.** Register a one-shot `sync` event with the service worker when a mutation is enqueued. Chrome and Android honor it. Safari does not, so iOS relies on foreground push. Do not design around Background Sync being reliable.
+
+### Conflict rules
+
+Stated in the offline strategy above, restated here in terms of the stores:
+
+- `equipmentPhoto`, `voiceNote`, `inspectionItem`: append-only. Never conflict.
+- `equipmentAnnotation`: last-write-wins per annotation id. Annotations are small independent objects, not one big blob, so two supers annotating the same photo do not clobber each other.
+- `moStatus`: server-authoritative. The local row shows the optimistic status with a "pending" badge until the server confirms. If the server rejects it (someone else closed the MO first), revert the local row and surface a toast.
+
+### Cache scope and eviction
+
+- Cache **only** buildings the user is assigned to. A PM with a large portfolio gets the buildings in their assignment list, nothing else. Recompute the list on every pull and evict rows for buildings that dropped out.
+- Equipment, contacts, and MOs for those buildings are cached in full. They are small text rows. Even a large building is tens of kilobytes.
+- Photos already on the server are **not** cached locally. Thumbnails are fetched on demand and cached by the service worker with a size cap. Full-res is network-only.
+- Blobs in the `blobs` store are deleted the moment their mutation reaches `done`. The store should be near-empty on a healthy device.
+- If storage quota is hit, refuse new captures with a clear message rather than evicting pending uploads. Losing a super's photos is worse than blocking a new one.
+
+---
+
+## Findings from the public PropGlue repos
+
+Read on 2026-09-15 from `mmamakas/propglue-docs` and `mmamakas/propglue-mobile-design`. The main `mmamakas/propglue` repo is private and was not readable from this session, so schema and service details remain **TBD**.
+
+### Platform facts that affect this design
+
+- **Super is a view-only role today.** The team-invite flow lists Super as "view-only for specific buildings." The super's core mobile loop (photo, annotate, voice note, MO status) requires write access. Either the Super role gains scoped write permissions on equipment and MOs, or a new field-tech role is introduced. This is a main-app change and a phase-0 prerequisite.
+- **Photos already support annotation on web** ("capture conditions, annotate images, and link to projects"). The mobile annotation feature should reuse that data model rather than invent one.
+- **Existing modules:** Buildings, Documents, Permits & Violations, Contractors, Equipment, Capital Projects, Secure Vault, Photos, NYC DOB integration, audit logs, RBAC. Equipment tracking is confirmed as an existing module, which is good for phase 1.
+- **No Maintenance Orders module is listed.** Capital Projects exists, but nothing named work orders, tickets, or maintenance orders. Either MOs live somewhere the docs do not mention, or they need to be built in the main app before the mobile MO feature can exist.
+- **No Tenants module is listed.** Contractors are a first-class module, but tenant contacts are not visible in the docs. The universal directory depends on tenant records existing in the main app.
+- **Buildings carry NYC identifiers** (BIN, block and lot, borough). No lat/lng is mentioned. Geofencing needs geocoding from the address, which is a small main-app addition.
+
+### Conflicts with the April 2026 mobile design
+
+`propglue-mobile-design/docs/requirements/building-ops-mobile.md` (v1.0, dated 2026-04-22) describes a different product than the one scoped here. The differences need an explicit decision, not a quiet merge.
+
+| Topic | April 2026 doc | This doc (Sept 2026) |
+|---|---|---|
+| Phase 1 focus | Move-in / freight elevator calendar and mass notifications | Equipment photo capture and annotation |
+| Maintenance orders | Explicitly out of scope ("handled via 3CX or web") | In scope for supers |
+| Elevator calendar | Phase 1 core feature with approval workflow | Explicitly cut from v1 |
+| Tenant as app user | Yes, with own tab set, slot requests, notifications | Not a mobile user in v1 |
+| Owner as app user | Not mentioned | Yes, with approval inbox |
+| Shell | Native (Expo push, refresh token in SecureStore) | PWA first, Capacitor later |
+| Push | FCM and APNs via Expo | Web Push via VAPID, APNs/FCM only after Capacitor wrap |
+| Mass notifications | Phase 1 feature with full spec | Not in scope |
+| Incident logging | Phase 1 feature | Not in scope (closest analog is MO with photo) |
+| Vendor scheduling and COI | Phase 1 feature | Not in scope |
+
+The April doc's feature specs for the elevator calendar and mass notifications are detailed and usable. If either comes back into scope, they should be lifted as-is rather than rewritten.
+
+**Recommendation:** treat the September scope as current and the April doc as a backlog of well-specified phase-2 candidates. Elevator calendar and mass notifications are the two most likely to return, since both were explicitly confirmed with Manny in April.
+
+---
+
 ## Risks
 
+- **Super role is view-only** — the whole super workflow is blocked until the main app grants scoped write access. Resolve in phase 0 or nothing in phase 1 ships.
+- **Maintenance orders may not exist in the main app** — if there is no MO entity, phase 2 needs a main-app workstream first.
+- **Two mobile designs exist** — the April 2026 doc and this one disagree on scope, shell, and users. Pick one explicitly before any code is written.
 - **iOS Web Push reliability** — the single biggest variable. Drives the Capacitor wrap decision and may force it earlier than planned.
 - **Super location tracking → labor / legal exposure** if rolled out without the consent and disclosure flow. Don't let this ship without sign-off from whoever handles labor policy at propglue.
 - **OCR quality variance** — receipts and invoices are easier than handwritten forms. Set expectations on which document types are supported; refuse silent failures.
